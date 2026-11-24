@@ -235,6 +235,15 @@ fn main() -> ExitCode {
                 creabim_store::save(out, &doc).map_err(|e| format!("{out}: {e}"))
             }
         }),
+        ["ifc", "--layers", input, out] => load(input).and_then(|m| {
+            let name = std::path::Path::new(out)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "CreaBIM Project".into());
+            let mut opts = ExportOptions::for_model(&m, &name);
+            opts.body = creabim_ifc::IfcBody::Layers;
+            std::fs::write(out, export_ifc4(&m, &opts)).map_err(|e| e.to_string())
+        }),
         ["ifc", input, out] => load(input).and_then(|m| {
             let name = std::path::Path::new(out)
                 .file_stem()

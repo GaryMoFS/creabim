@@ -1032,14 +1032,18 @@ impl<'a> Importer<'a> {
             if !l.is("IFCMATERIALLAYER") {
                 continue;
             }
-            let material = l.arg(0).as_ref().and_then(|m| self.material_entity(m));
             let thickness = self.g.length(l.arg(1)).unwrap_or(0.0).max(MIN_LAYER);
             let ventilated = l.arg(2).as_enum() == Some("T");
             let category = l.arg(5).as_str().or(l.arg(3).as_str()).unwrap_or("");
-            let function = if material.is_none() && ventilated {
+            let function = if l.arg(0).is_null() && ventilated {
                 LayerFunction::AirGap
             } else {
                 LayerFunction::from_ifc(category, ventilated)
+            };
+            let material = if function == LayerFunction::AirGap {
+                None
+            } else {
+                l.arg(0).as_ref().and_then(|m| self.material_entity(m))
             };
             layers.push(Layer::new(function, material, thickness));
         }

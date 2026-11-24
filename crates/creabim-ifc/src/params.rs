@@ -309,6 +309,8 @@ pub(crate) fn type_from(category: TypeCategory, curtain: bool, p: &Props) -> Typ
                     depth: l("FrameDepth", d.depth),
                     panes_across: count("PanesAcross"),
                     panes_up: count("PanesUp"),
+                    reveal: len(p, "Reveal").filter(|v| *v >= 0.0),
+                    material: None,
                 },
                 material: None,
             };

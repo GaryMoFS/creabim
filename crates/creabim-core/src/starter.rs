@@ -372,6 +372,8 @@ fn materials_and_types(b: &mut Builder) {
                 depth: 0.09,
                 panes_across: across,
                 panes_up: up,
+                reveal: None,
+                material: None,
             },
             material: frames,
         })

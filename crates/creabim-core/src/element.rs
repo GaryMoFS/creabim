@@ -1515,6 +1515,14 @@ pub struct OpeningFrame {
     /// Window panes side by side and one above the other, split by bars.
     pub panes_across: u32,
     pub panes_up: u32,
+    /// Optional inset (reveal) from the wall's exterior face, in metres.
+    /// `None` centres the frame in the wall.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reveal: Option<f64>,
+    /// Optional separate material for the frame (and glazing bars / sill);
+    /// `None` uses the opening's own material.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub material: Option<ElementId>,
 }
 
 impl Default for OpeningFrame {
@@ -1524,6 +1532,8 @@ impl Default for OpeningFrame {
             depth: 0.1,
             panes_across: 1,
             panes_up: 1,
+            reveal: None,
+            material: None,
         }
     }
 }
@@ -1537,11 +1547,29 @@ impl OpeningFrame {
     /// members no wider than a third of the opening, at least one pane.
     pub fn fitted(&self, w: f64, h: f64, t: f64) -> Self {
         let fw = self.width.clamp(0.01, (w.min(h) / 3.0).max(0.01));
+        let depth = self.depth.clamp(0.02, t.max(0.02));
+        let max_reveal = (t - depth).max(0.0);
         Self {
             width: fw,
-            depth: self.depth.clamp(0.02, t.max(0.02)),
+            depth,
             panes_across: self.panes_across.clamp(1, 12),
             panes_up: self.panes_up.clamp(1, 12),
+            reveal: self.reveal.map(|r| r.clamp(0.0, max_reveal)),
+            material: self.material,
+        }
+    }
+
+    /// Effective reveal (inset from the wall's exterior face) for a wall of
+    /// thickness `t`, and the resulting frame centre `y` in opening coordinates.
+    pub fn reveal_and_center(&self, t: f64) -> (f64, f64) {
+        let max_reveal = (t - self.depth).max(0.0);
+        match self.reveal {
+            Some(r) => {
+                let r = r.clamp(0.0, max_reveal);
+                let center_y = t / 2.0 - r - self.depth / 2.0;
+                (r, center_y)
+            }
+            None => (max_reveal / 2.0, 0.0),
         }
     }
 }

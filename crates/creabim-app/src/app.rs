@@ -6941,17 +6941,28 @@ impl CreaBimApp {
 
     /// A material picker; "New material" adds one and picks it.
     fn material_combo(&mut self, ui: &mut egui::Ui, current: &mut Option<ElementId>) -> bool {
+        self.material_combo_labeled(ui, "Material", "By type", current)
+    }
+
+    /// A material picker with a custom row label and unset text.
+    fn material_combo_labeled(
+        &mut self,
+        ui: &mut egui::Ui,
+        row_label: &str,
+        unset_label: &str,
+        current: &mut Option<ElementId>,
+    ) -> bool {
         let materials = self.materials();
         let name = current
             .and_then(|id| materials.iter().find(|m| m.0 == id))
-            .map_or("By type", |m| m.1.as_str())
+            .map_or(unset_label, |m| m.1.as_str())
             .to_string();
         let mut changed = false;
         let mut create = false;
-        crate::app::helpui::combo(ui, "Material")
+        crate::app::helpui::combo(ui, row_label)
             .selected_text(name)
             .show_ui(ui, |ui| {
-                changed |= ui.selectable_value(current, None, "By type").changed();
+                changed |= ui.selectable_value(current, None, unset_label).changed();
                 for (id, n) in &materials {
                     changed |= ui.selectable_value(current, Some(*id), n).changed();
                 }
@@ -8988,6 +8999,14 @@ impl CreaBimApp {
                     }
                     ui.separator();
                     ui.label(egui::RichText::new("Frame").strong());
+                    if self.material_combo_labeled(
+                        ui,
+                        "Frame material",
+                        "Same as opening",
+                        &mut o.frame.material,
+                    ) {
+                        label = "Frame material"
+                    }
                     if num(ui, "Frame width", &mut o.frame.width, 0.01, 0.5) {
                         label = "Frame width"
                     }

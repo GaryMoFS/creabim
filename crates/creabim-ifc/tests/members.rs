@@ -80,6 +80,12 @@ fn members_export_with_their_ifc4_classes() {
         .filter(|l| l.contains("IFCRELCONTAINEDINSPATIALSTRUCTURE"))
         .count();
     assert!(contained >= 1);
+    for pset in ["Pset_RoofCommon", "Pset_StairCommon", "Pset_RailingCommon"] {
+        assert!(text.contains(pset), "missing {pset}");
+    }
+    for prop in ["NumberOfRiser", "NumberOfTreads", "RiserHeight", "TreadLength"] {
+        assert!(text.contains(prop), "missing {prop}");
+    }
 }
 
 #[test]
