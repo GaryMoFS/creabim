@@ -391,6 +391,13 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
         }
     };
 
+    // Per-solid styles for elements, openings, curtain walls, and layer parts,
+    // plus glass plates for curtain walls, emitted once materials and surface
+    // styles are written.
+    let mut solid_part_styles: Vec<(Ref, PartStyleKind)> = Vec::new();
+    let mut glass_plate_products: Vec<Ref> = Vec::new();
+    let mut window_by_frame_mat: HashMap<Option<ElementId>, Vec<Ref>> = HashMap::new();
+
     for e in model.iter() {
         if cutters.contains(&e.id) {
             continue;
@@ -436,6 +443,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                     .collect();
                 let mut parts = vec![];
                 let mut solid_parts = vec![];
+                let cw_mat_id = creabim_core::material_of(model, e).map(|(m, _)| m.id);
                 for b in creabim_geom::curtain::curtain_boxes(wall, grid, &openings) {
                     use creabim_geom::curtain::CurtainPart;
                     let size = b.hi - b.lo;
@@ -458,7 +466,11 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         ),
                     );
                     parts.push(p);
-                    if b.part != CurtainPart::Glass {
+                    if b.part == CurtainPart::Glass {
+                        solid_part_styles.push((solid, PartStyleKind::Glass));
+                        glass_plate_products.push(p);
+                    } else {
+                        solid_part_styles.push((solid, PartStyleKind::Frame(cw_mat_id)));
                         solid_parts.push(p);
                     }
                 }
@@ -469,13 +481,21 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         format!("{g},$,$,$,{r},{}", list(&parts)),
                     );
                 }
-                if let Some((m, _)) = creabim_core::material_of(model, e) {
-                    by_material.entry(m.id).or_default().extend(solid_parts);
+                if let Some(mid) = cw_mat_id {
+                    by_material.entry(mid).or_default().extend(solid_parts);
                 }
                 let mut props = curtain_props(grid);
                 props.push(("Length", Prop::Length(wall.length())));
                 props.push(("Height", Prop::Length(wall.height)));
                 c.pset_on(&[r], CURTAIN_PSET, &props);
+                c.pset_on(
+                    &[r],
+                    "Pset_CurtainWallCommon",
+                    &[
+                        ("Reference", Prop::Label(e.name.clone())),
+                        ("IsExternal", Prop::Bool(true)),
+                    ],
+                );
             }
             ElementKind::Wall(wall) => {
                 let Some(&(_, spl)) = storeys.get(&wall.level) else {
@@ -514,6 +534,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         .map(|z| z - z0)
                         .fold(wall.height, f64::max)
                 });
+                let mut clipped = false;
                 let mut solids = vec![];
                 for local in ends.local_outlines(wall, core) {
                     let mut pts: Vec<Ref> = local
@@ -536,12 +557,23 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                             DVec2::new(q.dot(d), q.dot(n))
                         };
                         for f in &tp.faces {
+                            // Skip faces that lie entirely at or above the extrusion top:
+                            // a coplanar horizontal half-space at z == depth is a no-op
+                            // that causes OpenCASCADE/IfcOpenShell boolean failures.
+                            let min_z = f
+                                .outline
+                                .iter()
+                                .map(|p| f.c + f.g.dot(*p) - z0)
+                                .fold(f64::INFINITY, f64::min);
+                            if min_z >= depth - 1e-6 {
+                                continue;
+                            }
                             solid = clip_under(&mut c, solid, f, to_local, d, n, origin, z0);
+                            clipped = true;
                         }
                     }
                     solids.push(solid);
                 }
-                let clipped = top.is_some();
                 // the axis lets other tools (and our importer) recover the
                 // location line whatever the joins did to the ends
                 let a0 = c.w.add("IFCCARTESIANPOINT", point2(0.0, 0.0));
@@ -551,16 +583,26 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                     "IFCSHAPEREPRESENTATION",
                     format!("{},'Axis','Curve2D',({axis_line})", c.axis),
                 );
+                let body_mat = primary_material_id(model, e);
                 let body_rep = match cut {
                     Some(m) => {
                         let fs = tessellate(&mut c, m, |p| {
                             let q = p.truncate() - origin;
                             DVec3::new(q.dot(d), q.dot(n), p.z - z0)
                         });
+                        solid_part_styles.push((fs, PartStyleKind::Frame(body_mat)));
                         c.body_rep("Tessellation", &[fs])
                     }
-                    None if clipped => c.body_rep("Clipping", &solids),
-                    None => c.body_rep("SweptSolid", &solids),
+                    None => {
+                        for &s in &solids {
+                            solid_part_styles.push((s, PartStyleKind::Frame(body_mat)));
+                        }
+                        if clipped {
+                            c.body_rep("Clipping", &solids)
+                        } else {
+                            c.body_rep("SweptSolid", &solids)
+                        }
+                    }
                 };
                 let shape = c.w.add(
                     "IFCPRODUCTDEFINITIONSHAPE",
@@ -581,6 +623,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         z,
                         &joins,
                         &mut by_material,
+                        &mut solid_part_styles,
                         layers_mode,
                     );
                 }
@@ -621,17 +664,31 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                     "IFCEXTRUDEDAREASOLID",
                     format!("{prof},{pos},{},{}", c.z_axis, real(slab.thickness)),
                 );
+                let body_mat = primary_material_id(model, e);
                 let shape = match cut {
                     Some(m) => {
                         let z0 = elevation(Some(slab.level));
                         let fs = tessellate(&mut c, m, |p| p - DVec3::Z * z0);
+                        solid_part_styles.push((fs, PartStyleKind::Frame(body_mat)));
                         c.shape("Tessellation", &[fs])
                     }
-                    None => c.shape("SweptSolid", &[solid]),
+                    None => {
+                        solid_part_styles.push((solid, PartStyleKind::Frame(body_mat)));
+                        c.shape("SweptSolid", &[solid])
+                    }
                 };
                 let r = product(&mut c, "IFCSLAB", e, pl, shape, ",$,.FLOOR.");
                 of_type(e, r);
                 contained.entry(Some(slab.level)).or_default().push(r);
+                c.pset_on(
+                    &[r],
+                    "Pset_SlabCommon",
+                    &[
+                        ("Reference", Prop::Label(e.name.clone())),
+                        ("LoadBearing", Prop::Bool(true)),
+                        ("PitchAngle", Prop::Real(0.0)),
+                    ],
+                );
                 if cut.is_none() || layers_mode {
                     let z = elevation(Some(slab.level));
                     write_layer_parts(
@@ -643,6 +700,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         z,
                         &joins,
                         &mut by_material,
+                        &mut solid_part_styles,
                         layers_mode,
                     );
                 }
@@ -667,6 +725,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 };
                 let pl = c.local_placement(Some(spl), DVec3::ZERO, None);
                 let solid = c.plan_extrusion(&outline, ceiling.height, ceiling.thickness);
+                solid_part_styles.push((solid, PartStyleKind::Frame(primary_material_id(model, e))));
                 let shape = c.shape("SweptSolid", &[solid]);
                 let r = product(&mut c, "IFCCOVERING", e, pl, shape, ",$,.CEILING.");
                 contained.entry(Some(ceiling.level)).or_default().push(r);
@@ -712,6 +771,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         format!("{pts},$,.T.,({}),$", tris.join(",")),
                     ),
                 };
+                solid_part_styles.push((fs, PartStyleKind::Frame(primary_material_id(model, e))));
                 let shape = c.shape("Tessellation", &[fs]);
                 let (class, tail) = free_mesh_entity(&f.ifc_class);
                 let r = product(&mut c, &class, e, pl, shape, &tail);
@@ -741,6 +801,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 let pl = c.local_placement(Some(spl), DVec3::ZERO, None);
                 let z0 = elevation(level);
                 let fs = tessellate(&mut c, &mesh, |p| p - DVec3::Z * z0);
+                solid_part_styles.push((fs, PartStyleKind::Frame(primary_material_id(model, e))));
                 let shape = c.shape("Tessellation", &[fs]);
                 let (class, tail) = match k {
                     ElementKind::Part(_) | ElementKind::Site(_) => part_entity(e),
@@ -773,6 +834,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         z0,
                         &joins,
                         &mut by_material,
+                        &mut solid_part_styles,
                         layers_mode,
                     );
                 }
@@ -784,6 +846,37 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         let solid = c.plan_extrusion(h, z, roof.peak() + vt + 0.2);
                         c.void(r, pl, solid, &format!("{} hole {}", e.name, i + 1), None);
                     }
+                    c.pset_on(
+                        &[r],
+                        "Pset_RoofCommon",
+                        &[
+                            ("Reference", Prop::Label(e.name.clone())),
+                            ("IsExternal", Prop::Bool(true)),
+                        ],
+                    );
+                } else if let ElementKind::Stair(stair) = k {
+                    let layout = stair.layout(stair.rise(model));
+                    let treads = layout.risers.saturating_sub(layout.flights.len() as u32);
+                    c.pset_on(
+                        &[r],
+                        "Pset_StairCommon",
+                        &[
+                            ("Reference", Prop::Label(e.name.clone())),
+                            ("NumberOfRiser", Prop::Count(layout.risers as i64)),
+                            ("NumberOfTreads", Prop::Count(treads as i64)),
+                            ("RiserHeight", Prop::Length(layout.riser)),
+                            ("TreadLength", Prop::Length(stair.tread)),
+                        ],
+                    );
+                } else if let ElementKind::Railing(railing) = k {
+                    c.pset_on(
+                        &[r],
+                        "Pset_RailingCommon",
+                        &[
+                            ("Reference", Prop::Label(e.name.clone())),
+                            ("Height", Prop::Length(railing.height)),
+                        ],
+                    );
                 }
                 if let Some((a, _)) = creabim_core::assembly_of(model, e) {
                     // a roof's shape isn't a straight extrusion: the set itself
@@ -876,6 +969,17 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
         } else {
             c.local_placement(Some(pl), start, None)
         };
+        let leaf_mat_id = creabim_core::material_of(model, e).map(|(m, _)| m.id);
+        let frame_mat_id = o
+            .frame
+            .material
+            .filter(|id| {
+                matches!(
+                    model.get(*id).map(|m| &m.kind),
+                    Some(ElementKind::Material(_))
+                )
+            })
+            .or(leaf_mat_id);
         let mut parts = Vec::new();
         for b in creabim_geom::opening::opening_boxes(o, wall) {
             let size = b.hi - b.lo;
@@ -885,12 +989,22 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 b.lo
             };
             let pos = c.placement3d(lo, None, None);
-            parts.push(c.rect_extrusion(size.truncate() / 2.0, size.x, size.y, pos, size.z));
+            let solid = c.rect_extrusion(size.truncate() / 2.0, size.x, size.y, pos, size.z);
+            let style_kind = match b.part {
+                creabim_geom::opening::Part::Glass => PartStyleKind::Glass,
+                creabim_geom::opening::Part::Handle => PartStyleKind::Metal,
+                creabim_geom::opening::Part::Frame => PartStyleKind::Frame(frame_mat_id),
+                creabim_geom::opening::Part::Leaf => PartStyleKind::Frame(leaf_mat_id),
+            };
+            solid_part_styles.push((solid, style_kind));
+            parts.push(solid);
         }
         if parts.is_empty() {
             continue;
         }
         let fill_shape = c.shape("SweptSolid", &parts);
+        let fitted_frame = creabim_geom::opening::Fitted::of(o, wall)
+            .map_or(o.frame.clone(), |f| f.frame);
         // hinged on the left seen along its y axis (the way it swings)
         let hinge_left = !o.flip_hand != turned;
         let (class, tail) = match o.kind {
@@ -910,9 +1024,10 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
             OpeningKind::Window => (
                 "IFCWINDOW",
                 format!(
-                    ",$,{},{},.WINDOW.,.SINGLE_PANEL.,$",
+                    ",$,{},{},.WINDOW.,{},$",
                     real(o.height),
-                    real(o.width)
+                    real(o.width),
+                    window_partitioning(fitted_frame.panes_across, fitted_frame.panes_up),
                 ),
             ),
             OpeningKind::Hole => continue,
@@ -921,8 +1036,47 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
         of_type(e, fill);
         let g = c.guid();
         c.w.add("IFCRELFILLSELEMENT", format!("{g},$,$,$,{opening},{fill}"));
-        if let Some((m, _)) = creabim_core::material_of(model, e) {
-            by_material.entry(m.id).or_default().push(fill);
+        match o.kind {
+            OpeningKind::Door => {
+                if let Some(mid) = leaf_mat_id.or(frame_mat_id) {
+                    by_material.entry(mid).or_default().push(fill);
+                }
+                let (reveal, _) = fitted_frame.reveal_and_center(wall.thickness);
+                let leaf_t = (fitted_frame.depth * 0.6).min(0.045);
+                let op = if hinge_left {
+                    ".SWINGING."
+                } else {
+                    ".SWINGING."
+                };
+                let (lining, panel) =
+                    door_lining_and_panel_props(&mut c, &fitted_frame, Some(reveal), leaf_t, op);
+                for pset in [lining, panel] {
+                    let g = c.guid();
+                    c.w.add(
+                        "IFCRELDEFINESBYPROPERTIES",
+                        format!("{g},$,$,$,({fill}),{pset}"),
+                    );
+                }
+                c.pset_on(
+                    &[fill],
+                    "Pset_DoorCommon",
+                    &[("Reference", Prop::Label(e.name.clone()))],
+                );
+            }
+            OpeningKind::Window => {
+                let (reveal, _) = fitted_frame.reveal_and_center(wall.thickness);
+                let (lining, panel) =
+                    window_lining_and_panel_props(&mut c, &fitted_frame, Some(reveal));
+                for pset in [lining, panel] {
+                    let g = c.guid();
+                    c.w.add(
+                        "IFCRELDEFINESBYPROPERTIES",
+                        format!("{g},$,$,$,({fill}),{pset}"),
+                    );
+                }
+                window_by_frame_mat.entry(frame_mat_id).or_default().push(fill);
+            }
+            OpeningKind::Hole => {}
         }
         let level = match model.get(o.host).map(|h| &h.kind) {
             Some(ElementKind::Wall(w)) => w.level,
@@ -1031,8 +1185,135 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
         }
     }
 
+    // Window glazing material & style: reuse an existing glass material from
+    // the model when present; otherwise emit a clear glass surface style for
+    // per-solid IFCSTYLEDITEMs without adding an extra IFCMATERIAL to the model.
+    let window_glass_mat: Option<Ref> = model
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ElementKind::Material(m) if m.category == "glass" => Some(e),
+            _ => None,
+        })
+        .min_by_key(|e| if e.name == "Glass, clear" { 0 } else { 1 })
+        .and_then(|e| material_refs.get(&e.id).copied());
+
+    let mut window_glass_style: Option<Ref> = model
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ElementKind::Material(m) if m.category == "glass" => Some(e),
+            _ => None,
+        })
+        .min_by_key(|e| if e.name == "Glass, clear" { 0 } else { 1 })
+        .and_then(|e| material_styles.get(&e.id).copied());
+
+    if window_glass_style.is_none()
+        && solid_part_styles
+            .iter()
+            .any(|(_, k)| matches!(k, PartStyleKind::Glass))
+    {
+        let rgb = c.w.add("IFCCOLOURRGB", "$,0.75,0.88,0.92".to_string());
+        let rendering = c.w.add(
+            "IFCSURFACESTYLERENDERING",
+            format!("{rgb},0.7,$,$,$,$,$,IFCSPECULARROUGHNESS(0.05),.GLASS."),
+        );
+        let style = c.w.add(
+            "IFCSURFACESTYLE",
+            format!("{},.BOTH.,({rendering})", string("Glass, clear")),
+        );
+        window_glass_style = Some(style);
+    }
+
+    let mut metal_handle_style: Option<Ref> = model
+        .iter()
+        .filter_map(|e| match &e.kind {
+            ElementKind::Material(m) if m.metallic >= 0.5 => Some(e),
+            _ => None,
+        })
+        .min_by_key(|e| if e.name.contains("Steel") { 0 } else { 1 })
+        .and_then(|e| material_styles.get(&e.id).copied());
+
+    if metal_handle_style.is_none()
+        && solid_part_styles
+            .iter()
+            .any(|(_, k)| matches!(k, PartStyleKind::Metal))
+    {
+        let rgb = c.w.add("IFCCOLOURRGB", "$,0.72,0.74,0.76".to_string());
+        let rendering = c.w.add(
+            "IFCSURFACESTYLERENDERING",
+            format!("{rgb},0.,$,$,$,$,$,IFCSPECULARROUGHNESS(0.25),.METAL."),
+        );
+        let style = c.w.add(
+            "IFCSURFACESTYLE",
+            format!("{},.BOTH.,({rendering})", string("Handle metal")),
+        );
+        metal_handle_style = Some(style);
+    }
+
+    for (solid, kind) in solid_part_styles {
+        let style = match kind {
+            PartStyleKind::Glass => window_glass_style,
+            PartStyleKind::Metal => metal_handle_style,
+            PartStyleKind::Frame(id) => id.and_then(|id| material_styles.get(&id).copied()),
+        };
+        if let Some(style) = style {
+            c.w.add("IFCSTYLEDITEM", format!("{solid},({style}),$"));
+        }
+    }
+
+    if let Some(gm) = window_glass_mat {
+        if !glass_plate_products.is_empty() {
+            let g = c.guid();
+            c.w.add(
+                "IFCRELASSOCIATESMATERIAL",
+                format!("{g},$,$,$,{},{gm}", list(&glass_plate_products)),
+            );
+        }
+    }
+
+    let mut window_constituents: HashMap<Option<ElementId>, Ref> = HashMap::new();
+    let mut get_window_constituent_set =
+        |c: &mut Ctx, frame_mat: Option<ElementId>| -> Option<Ref> {
+            if let Some(&cs) = window_constituents.get(&frame_mat) {
+                return Some(cs);
+            }
+            let mut items = Vec::new();
+            if let Some(m) = frame_mat.and_then(|id| material_refs.get(&id).copied()) {
+                items.push(
+                    c.w.add("IFCMATERIALCONSTITUENT", format!("'Frame',$,{m},$,$")),
+                );
+            }
+            if let Some(gm) = window_glass_mat {
+                items.push(
+                    c.w.add("IFCMATERIALCONSTITUENT", format!("'Glazing',$,{gm},$,$")),
+                );
+            }
+            if items.is_empty() {
+                return None;
+            }
+            let cs = c.w.add(
+                "IFCMATERIALCONSTITUENTSET",
+                format!("$,$,{}", list(&items)),
+            );
+            window_constituents.insert(frame_mat, cs);
+            Some(cs)
+        };
+
+    for (frame_mat, users) in window_by_frame_mat {
+        if users.is_empty() {
+            continue;
+        }
+        if let Some(cs) = get_window_constituent_set(&mut c, frame_mat) {
+            let g = c.guid();
+            c.w.add(
+                "IFCRELASSOCIATESMATERIAL",
+                format!("{g},$,$,$,{},{cs}", list(&users)),
+            );
+        }
+    }
+
     // Assemblies as layer sets, unused ones too; each layered element gets
     // a usage saying how the set lies in it (walls across, slabs down).
+    let mut air_gap_mat: Option<Ref> = None;
     let mut layer_sets: HashMap<ElementId, Ref> = HashMap::new();
     for e in model.iter() {
         let ElementKind::Assembly(a) = &e.kind else {
@@ -1045,11 +1326,37 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
             .layers
             .iter()
             .map(|l| {
+                let air = l.function == creabim_core::LayerFunction::AirGap;
                 let m = l
                     .material
-                    .and_then(|m| material_refs.get(&m))
+                    .and_then(|m| material_refs.get(&m).copied())
+                    .or_else(|| {
+                        air.then(|| {
+                            *air_gap_mat.get_or_insert_with(|| {
+                                let m = c.w.add("IFCMATERIAL", "'Air gap',$,'AirGap'".to_string());
+                                let rgb = c.w.add("IFCCOLOURRGB", "$,0.9,0.95,1.".to_string());
+                                let rendering = c.w.add(
+                                    "IFCSURFACESTYLERENDERING",
+                                    format!("{rgb},1.,$,$,$,$,$,$,.NOTDEFINED."),
+                                );
+                                let style = c.w.add(
+                                    "IFCSURFACESTYLE",
+                                    format!("'Air gap',.BOTH.,({rendering})"),
+                                );
+                                let styled = c.w.add("IFCSTYLEDITEM", format!("$,({style}),$"));
+                                let styled_rep = c.w.add(
+                                    "IFCSTYLEDREPRESENTATION",
+                                    format!("{},'Style','Material',({styled})", c.body),
+                                );
+                                c.w.add(
+                                    "IFCMATERIALDEFINITIONREPRESENTATION",
+                                    format!("$,$,({styled_rep}),{m}"),
+                                );
+                                m
+                            })
+                        })
+                    })
                     .map_or("$".to_string(), |r| r.to_string());
-                let air = l.function == creabim_core::LayerFunction::AirGap;
                 c.w.add(
                     "IFCMATERIALLAYER",
                     format!(
@@ -1119,33 +1426,65 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
             "" => "$".to_string(),
             d => string(d),
         };
-        let head = format!(
-            "{},$,{},{description},$,({set}),$,$,$",
-            string(&e.id.ifc_guid()),
-            string(&e.name)
-        );
+        let mut psets = vec![set];
         use creabim_core::TypeParams as P;
         let (class, tail) = match &t.params {
-            P::Wall(w) if w.curtain.is_some() => ("IFCCURTAINWALLTYPE", ",.NOTDEFINED."),
-            P::Wall(_) => ("IFCWALLTYPE", ",.STANDARD."),
-            P::Door(_) => ("IFCDOORTYPE", ",.DOOR.,.SINGLE_SWING_LEFT.,.F.,$"),
-            P::Window(_) => ("IFCWINDOWTYPE", ",.WINDOW.,.SINGLE_PANEL.,.F.,$"),
-            P::Slab(_) => ("IFCSLABTYPE", ",.FLOOR."),
-            P::Roof(_) => ("IFCROOFTYPE", ",.NOTDEFINED."),
-            P::Column(_) => ("IFCCOLUMNTYPE", ",.COLUMN."),
-            P::Beam(_) => ("IFCBEAMTYPE", ",.BEAM."),
+            P::Wall(w) if w.curtain.is_some() => ("IFCCURTAINWALLTYPE", ",.NOTDEFINED.".to_string()),
+            P::Wall(_) => ("IFCWALLTYPE", ",.STANDARD.".to_string()),
+            P::Door(d) => {
+                let leaf_t = (d.frame.depth * 0.6).min(0.045);
+                let (lining, panel) = door_lining_and_panel_props(
+                    &mut c,
+                    &d.frame,
+                    d.frame.reveal,
+                    leaf_t,
+                    ".SWINGING.",
+                );
+                psets.push(lining);
+                psets.push(panel);
+                (
+                    "IFCDOORTYPE",
+                    ",.DOOR.,.SINGLE_SWING_LEFT.,.F.,$".to_string(),
+                )
+            }
+            P::Window(w) => {
+                let (lining, panel) =
+                    window_lining_and_panel_props(&mut c, &w.frame, w.frame.reveal);
+                psets.push(lining);
+                psets.push(panel);
+                (
+                    "IFCWINDOWTYPE",
+                    format!(
+                        ",.WINDOW.,{},.F.,$",
+                        window_partitioning(w.frame.panes_across, w.frame.panes_up)
+                    ),
+                )
+            }
+            P::Slab(_) => ("IFCSLABTYPE", ",.FLOOR.".to_string()),
+            P::Roof(_) => ("IFCROOFTYPE", ",.NOTDEFINED.".to_string()),
+            P::Column(_) => ("IFCCOLUMNTYPE", ",.COLUMN.".to_string()),
+            P::Beam(_) => ("IFCBEAMTYPE", ",.BEAM.".to_string()),
             P::Footing(f) => match f.kind {
-                creabim_core::FootingKind::Strip => ("IFCFOOTINGTYPE", ",.STRIP_FOOTING."),
-                creabim_core::FootingKind::Pad => ("IFCFOOTINGTYPE", ",.PAD_FOOTING."),
+                creabim_core::FootingKind::Strip => ("IFCFOOTINGTYPE", ",.STRIP_FOOTING.".to_string()),
+                creabim_core::FootingKind::Pad => ("IFCFOOTINGTYPE", ",.PAD_FOOTING.".to_string()),
             },
             P::Object(_) => unreachable!("object types are written above"),
         };
+        let head = format!(
+            "{},$,{},{description},$,{},$,$,$",
+            string(&e.id.ifc_guid()),
+            string(&e.name),
+            list(&psets),
+        );
         let tr = c.w.add(class, format!("{head}{tail}"));
-        let relating = t
-            .assembly()
-            .and_then(|a| layer_sets.get(&a))
-            .or_else(|| t.material().and_then(|m| material_refs.get(&m)))
-            .copied();
+        let relating = if matches!(&t.params, P::Window(_)) {
+            get_window_constituent_set(&mut c, t.material())
+        } else {
+            t.assembly()
+                .and_then(|a| layer_sets.get(&a))
+                .or_else(|| t.material().and_then(|m| material_refs.get(&m)))
+                .copied()
+        };
         if let Some(m) = relating {
             let g = c.guid();
             c.w.add("IFCRELASSOCIATESMATERIAL", format!("{g},$,$,$,({tr}),{m}"));
@@ -1410,6 +1749,25 @@ fn layers_differ(e: &Element, joins: &HashMap<ElementId, creabim_core::WallEnds>
     }
 }
 
+#[derive(Clone, Copy)]
+enum PartStyleKind {
+    Frame(Option<ElementId>),
+    Glass,
+    Metal,
+}
+
+/// Primary material id for an element: its direct material, or for a layered
+/// element the first layer with a material (exterior face for walls, top for
+/// slabs and roofs).
+fn primary_material_id(model: &Model, e: &Element) -> Option<ElementId> {
+    creabim_core::material_of(model, e)
+        .map(|(m, _)| m.id)
+        .or_else(|| {
+            creabim_core::assembly_of(model, e)
+                .and_then(|(_, a)| a.layers.iter().find_map(|l| l.material))
+        })
+}
+
 /// Element `host`'s layers as `IfcBuildingElementPart`s that make it up,
 /// each its own solid with its layer's material, where the layers are not
 /// all as the layer set puts them; the host keeps its body and layer set
@@ -1424,10 +1782,21 @@ fn write_layer_parts(
     z0: f64,
     joins: &HashMap<ElementId, creabim_core::WallEnds>,
     by_material: &mut HashMap<ElementId, Vec<Ref>>,
+    solid_part_styles: &mut Vec<(Ref, PartStyleKind)>,
     as_coverings: bool,
 ) {
     if as_coverings {
-        write_layer_coverings(c, model, e, host, spl, z0, joins, by_material);
+        write_layer_coverings(
+            c,
+            model,
+            e,
+            host,
+            spl,
+            z0,
+            joins,
+            by_material,
+            solid_part_styles,
+        );
         return;
     }
     if !layers_differ(e, joins) {
@@ -1453,6 +1822,7 @@ fn write_layer_parts(
         }
         let pl = c.local_placement(Some(spl), DVec3::ZERO, None);
         let fs = tessellate(c, &mesh, |p| p - DVec3::Z * z0);
+        solid_part_styles.push((fs, PartStyleKind::Frame(layer.material)));
         let shape = c.shape("Tessellation", &[fs]);
         let g = c.guid();
         let name = names
@@ -1494,6 +1864,7 @@ fn write_layer_coverings(
     z0: f64,
     joins: &HashMap<ElementId, creabim_core::WallEnds>,
     by_material: &mut HashMap<ElementId, Vec<Ref>>,
+    solid_part_styles: &mut Vec<(Ref, PartStyleKind)>,
 ) {
     use creabim_core::LayerFunction as F;
     let parts = creabim_geom::scene::layer_parts(model, e, joins);
@@ -1518,6 +1889,7 @@ fn write_layer_coverings(
             .map_or_else(|| format!("layer {}", layer.index + 1), |m| m.name.clone());
         let pl = c.local_placement(Some(spl), DVec3::ZERO, None);
         let fs = tessellate(c, &mesh, |p| p - DVec3::Z * z0);
+        solid_part_styles.push((fs, PartStyleKind::Frame(layer.material)));
         let shape = c.shape("Tessellation", &[fs]);
         let g = c.guid();
         let r = c.w.add(
@@ -1648,6 +2020,102 @@ fn opening_body(
         wall.thickness + 2.0 * eps,
     );
     (pl, c.shape("SweptSolid", &[solid]))
+}
+
+/// IFC4 `IfcWindowTypePartitioningEnum` for a grid of panes.
+fn window_partitioning(panes_across: u32, panes_up: u32) -> &'static str {
+    match (panes_across, panes_up) {
+        (1, 1) => ".SINGLE_PANEL.",
+        (2, 1) => ".DOUBLE_PANEL_VERTICAL.",
+        (1, 2) => ".DOUBLE_PANEL_HORIZONTAL.",
+        (3, 1) => ".TRIPLE_PANEL_VERTICAL.",
+        (1, 3) => ".TRIPLE_PANEL_HORIZONTAL.",
+        _ => ".USERDEFINED.",
+    }
+}
+
+/// Emit `IFCWINDOWLININGPROPERTIES` and `IFCWINDOWPANELPROPERTIES` for a window.
+fn window_lining_and_panel_props(
+    c: &mut Ctx,
+    frame: &creabim_core::OpeningFrame,
+    reveal_offset: Option<f64>,
+) -> (Ref, Ref) {
+    let bar = real(frame.width * 0.6);
+    let transom_thickness = if frame.panes_up > 1 { bar.clone() } else { "$".into() };
+    let mullion_thickness = if frame.panes_across > 1 { bar } else { "$".into() };
+    let first_transom = if frame.panes_up > 1 {
+        real(1.0 / frame.panes_up as f64)
+    } else {
+        "$".into()
+    };
+    let second_transom = if frame.panes_up > 2 {
+        real(2.0 / frame.panes_up as f64)
+    } else {
+        "$".into()
+    };
+    let first_mullion = if frame.panes_across > 1 {
+        real(1.0 / frame.panes_across as f64)
+    } else {
+        "$".into()
+    };
+    let second_mullion = if frame.panes_across > 2 {
+        real(2.0 / frame.panes_across as f64)
+    } else {
+        "$".into()
+    };
+    let lining_offset = reveal_offset.map_or_else(|| "$".into(), real);
+    let panel_y = real(((frame.depth - 0.02) / 2.0).max(0.0));
+    let lining_guid = c.guid();
+    let lining = c.w.add(
+        "IFCWINDOWLININGPROPERTIES",
+        format!(
+            "{lining_guid},$,'Window Lining',$,{},{},{transom_thickness},{mullion_thickness},{first_transom},{second_transom},{first_mullion},{second_mullion},$,{lining_offset},{},{panel_y}",
+            real(frame.depth),
+            real(frame.width),
+            real(frame.width),
+        ),
+    );
+    let panel_guid = c.guid();
+    let panel = c.w.add(
+        "IFCWINDOWPANELPROPERTIES",
+        format!(
+            "{panel_guid},$,'Window Panel',$,.FIXEDCASEMENT.,.MIDDLE.,{},{},$",
+            real(0.02),
+            real(frame.width),
+        ),
+    );
+    (lining, panel)
+}
+
+/// Emit `IFCDOORLININGPROPERTIES` and `IFCDOORPANELPROPERTIES` for a door.
+fn door_lining_and_panel_props(
+    c: &mut Ctx,
+    frame: &creabim_core::OpeningFrame,
+    reveal_offset: Option<f64>,
+    leaf_thickness: f64,
+    operation: &str,
+) -> (Ref, Ref) {
+    let lining_offset = reveal_offset.map_or_else(|| "$".into(), real);
+    let panel_y = real((frame.depth - leaf_thickness).max(0.0));
+    let lining_guid = c.guid();
+    let lining = c.w.add(
+        "IFCDOORLININGPROPERTIES",
+        format!(
+            "{lining_guid},$,'Door Lining',$,{},{},$,$,$,$,{lining_offset},$,$,$,$,{},{panel_y}",
+            real(frame.depth),
+            real(frame.width),
+            real(frame.width),
+        ),
+    );
+    let panel_guid = c.guid();
+    let panel = c.w.add(
+        "IFCDOORPANELPROPERTIES",
+        format!(
+            "{panel_guid},$,'Door Panel',$,{},{operation},1.,.MIDDLE.,$",
+            real(leaf_thickness),
+        ),
+    );
+    (lining, panel)
 }
 
 /// Rooms as IfcSpace: each its outline extruded from its floor to its

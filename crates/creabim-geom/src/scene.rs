@@ -849,18 +849,28 @@ fn opening_items(
     use crate::opening::Part;
     use creabim_core::OpeningKind;
     let material = creabim_core::material_of(model, e).map(|(_, m)| (m.color, m.surface()));
+    let frame_material = o
+        .frame
+        .material
+        .and_then(|id| model.get(id))
+        .and_then(|m| match &m.kind {
+            ElementKind::Material(mat) => Some((mat.color, mat.surface())),
+            _ => None,
+        })
+        .or(material);
     crate::opening::opening_meshes(o, w, level_z)
         .into_iter()
         .map(|(part, mesh)| {
-            let (color, surface) = match (part, o.kind, material) {
+            let (color, surface) = match (part, o.kind, material, frame_material) {
                 (Part::Glass, ..) => (GLASS_COLOR, GLASS_SURFACE),
                 (Part::Handle, ..) => ([0.72, 0.73, 0.75], [0.3, 1.0, 1.0]),
-                (_, _, Some(m)) => m,
-                (Part::Frame, OpeningKind::Window | OpeningKind::Hole, None) => {
+                (Part::Frame, _, _, Some(m)) => m,
+                (Part::Leaf, _, Some(m), _) => m,
+                (Part::Frame, OpeningKind::Window | OpeningKind::Hole, _, None) => {
                     ([0.93, 0.93, 0.91], PLAIN_SURFACE)
                 }
-                (Part::Frame, OpeningKind::Door, None) => ([0.50, 0.35, 0.22], PLAIN_SURFACE),
-                (Part::Leaf, _, None) => ([0.62, 0.45, 0.30], PLAIN_SURFACE),
+                (Part::Frame, OpeningKind::Door, _, None) => ([0.50, 0.35, 0.22], PLAIN_SURFACE),
+                (Part::Leaf, _, None, _) => ([0.62, 0.45, 0.30], PLAIN_SURFACE),
             };
             SceneItem {
                 id: e.id,

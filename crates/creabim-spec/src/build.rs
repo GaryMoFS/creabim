@@ -616,6 +616,8 @@ fn frame(c: &Ctx, fr: &f::Frame) -> core::OpeningFrame {
         depth: c.l(fr.depth),
         panes_across: fr.panes_across,
         panes_up: fr.panes_up,
+        reveal: None,
+        material: None,
     }
 }
 

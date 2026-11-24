@@ -76,6 +76,8 @@ pub fn opening_boxes(o: &Opening, wall: &Wall) -> Vec<PartBox> {
     let fw = f.frame.width;
     let hd = f.frame.depth / 2.0;
     let face = wall.thickness / 2.0;
+    let (_, cy) = f.frame.reveal_and_center(wall.thickness);
+    let (y0, y1) = (cy - hd, cy + hd);
     let mut out = Vec::new();
     let mut add = |part, lo: DVec3, hi: DVec3| {
         if (hi - lo).min_element() > 1e-6 {
@@ -84,17 +86,17 @@ pub fn opening_boxes(o: &Opening, wall: &Wall) -> Vec<PartBox> {
     };
     let b = DVec3::new;
     // jambs and head, round every opening
-    add(Part::Frame, b(0.0, -hd, 0.0), b(fw, hd, h));
-    add(Part::Frame, b(w - fw, -hd, 0.0), b(w, hd, h));
-    add(Part::Frame, b(fw, -hd, h - fw), b(w - fw, hd, h));
+    add(Part::Frame, b(0.0, y0, 0.0), b(fw, y1, h));
+    add(Part::Frame, b(w - fw, y0, 0.0), b(w, y1, h));
+    add(Part::Frame, b(fw, y0, h - fw), b(w - fw, y1, h));
     match o.kind {
         OpeningKind::Window => {
             // the sill member, then glazing bars splitting the glass
-            add(Part::Frame, b(fw, -hd, 0.0), b(w - fw, hd, fw));
+            add(Part::Frame, b(fw, y0, 0.0), b(w - fw, y1, fw));
             // the outside sill, from the frame out past the wall's face,
             // on the side the window faces out of (built facing +y)
-            if face > hd + 0.005 {
-                add(Part::Frame, b(0.0, hd, 0.0), b(w, face + SILL_NOSE, 0.03));
+            if face > y1 + 0.005 {
+                add(Part::Frame, b(0.0, y1, 0.0), b(w, face + SILL_NOSE, 0.03));
             }
             let (x0, x1, z0, z1) = (fw, w - fw, fw, h - fw);
             let (na, nu) = (f.frame.panes_across, f.frame.panes_up);
@@ -115,14 +117,14 @@ pub fn opening_boxes(o: &Opening, wall: &Wall) -> Vec<PartBox> {
             let xs = edges(x0, x1, na);
             let zs = edges(z0, z1, nu);
             for pair in xs.windows(2) {
-                add(Part::Frame, b(pair[0].1, -bd, z0), b(pair[1].0, bd, z1));
+                add(Part::Frame, b(pair[0].1, cy - bd, z0), b(pair[1].0, cy + bd, z1));
             }
             for &(xa, xb) in &xs {
                 for pair in zs.windows(2) {
-                    add(Part::Frame, b(xa, -bd, pair[0].1), b(xb, bd, pair[1].0));
+                    add(Part::Frame, b(xa, cy - bd, pair[0].1), b(xb, cy + bd, pair[1].0));
                 }
                 for &(za, zb) in &zs {
-                    add(Part::Glass, b(xa, -GLASS / 2.0, za), b(xb, GLASS / 2.0, zb));
+                    add(Part::Glass, b(xa, cy - GLASS / 2.0, za), b(xb, cy + GLASS / 2.0, zb));
                 }
             }
         }
@@ -131,12 +133,12 @@ pub fn opening_boxes(o: &Opening, wall: &Wall) -> Vec<PartBox> {
             let gap = 0.004;
             let lt = f.leaf();
             let (l0, l1) = (fw + gap, w - fw - gap);
-            add(Part::Leaf, b(l0, hd - lt, 0.01), b(l1, hd, h - fw - gap));
+            add(Part::Leaf, b(l0, y1 - lt, 0.01), b(l1, y1, h - fw - gap));
             // a lever handle on each face, on the side away from the hinge
             if l1 - l0 > 0.3 && h > 1.2 {
                 let x = l1 - 0.07;
                 let z = 1.0f64.min(h * 0.45);
-                let (f0, f1) = (hd - lt, hd);
+                let (f0, f1) = (y1 - lt, y1);
                 for (r0, r1, a0, a1) in [
                     (f1, f1 + 0.012, f1 + 0.045, f1 + 0.062),
                     (f0 - 0.012, f0, f0 - 0.062, f0 - 0.045),
@@ -485,5 +487,19 @@ mod tests {
         assert!((sill(&o).lo.y + 0.15 + SILL_NOSE).abs() < 1e-9);
         o.flip_facing = true;
         assert!((sill(&o).hi.y - 0.15 - SILL_NOSE).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reveal_insets_window_frame_and_glass_from_exterior_face() {
+        let mut frame = OpeningFrame::default();
+        frame.reveal = Some(0.05);
+        let o = opening(OpeningKind::Window, frame);
+        let boxes = opening_boxes(&o, &wall());
+        // Wall thickness = 0.30 (exterior face at y = -0.15 when not flipped).
+        // With reveal = 0.05 and frame depth = 0.10, outer frame face sits at -0.10
+        // and inner frame face sits at 0.00.
+        let glass = boxes.iter().find(|b| b.part == Part::Glass).unwrap();
+        let center_y = (glass.lo.y + glass.hi.y) / 2.0;
+        assert!((center_y + 0.05).abs() < 1e-9, "got {center_y}");
     }
 }
