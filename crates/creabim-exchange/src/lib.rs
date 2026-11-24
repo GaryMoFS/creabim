@@ -15,6 +15,7 @@ pub mod gltf_read;
 pub mod link;
 pub mod materials;
 pub mod shape;
+pub mod step;
 pub mod titleblock;
 
 pub use assign::{assign, Assign};

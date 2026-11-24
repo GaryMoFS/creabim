@@ -6,18 +6,33 @@
 //!
 //! glTF is Y-up; CreaBIM is Z-up, so (x, y, z) is written as (x, z, -y).
 
-use creabim_core::{ElementKind, Model, OpeningKind};
+use creabim_core::{ElementId, ElementKind, Model, OpeningKind};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 pub fn export_glb(model: &Model) -> Vec<u8> {
     let scene = creabim_geom::scene::drawn_elements(model);
+    export_glb_scene(model, &scene)
+}
+
+/// Export only the specified elements as a binary glTF (`.glb`), keeping their
+/// exact CreaBIM world coordinates (meters, Z-up mapped to glTF Y-up).
+pub fn export_glb_subset(model: &Model, ids: &[ElementId]) -> Vec<u8> {
+    let want: HashSet<ElementId> = ids.iter().copied().collect();
+    let scene: Vec<_> = creabim_geom::scene::drawn_elements(model)
+        .into_iter()
+        .filter(|item| want.contains(&item.id))
+        .collect();
+    export_glb_scene(model, &scene)
+}
+
+fn export_glb_scene(model: &Model, scene: &[creabim_geom::scene::SceneItem]) -> Vec<u8> {
     let mut bin: Vec<u8> = Vec::new();
     let (mut views, mut accessors, mut meshes, mut nodes) = (vec![], vec![], vec![], vec![]);
     let mut materials: Vec<Value> = Vec::new();
     let mut material_ids: HashMap<String, usize> = HashMap::new();
 
-    for item in &scene {
+    for item in scene {
         let Some(e) = model.get(item.id) else {
             continue;
         };

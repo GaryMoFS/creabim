@@ -725,6 +725,61 @@ impl CreaBimApp {
         }
     }
 
+    /// One-click SolidCraft round trip: export the selection (or whole model)
+    /// to `<exchange>/context.step` as native STEP AP214 B-rep faces/edges in
+    /// exact CreaBIM world coordinates, arm `<exchange>/return.glb` for live
+    /// reload, and launch SolidCraft.
+    pub(super) fn send_to_solidcraft(&mut self) {
+        let dir = std::path::Path::new(&self.path)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(|p| p.join(".solidcraft"))
+            .unwrap_or_else(|| std::env::temp_dir().join("creabim-solidcraft"));
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status = format!("Couldn't create SolidCraft exchange folder: {e}");
+            return;
+        }
+        let context_step = dir.join("context.step");
+        let return_path = dir.join("return.glb");
+        let ids = self.selection.all();
+        let step = creabim_exchange::step::export_step_subset(self.doc.model(), &ids);
+        if let Err(e) = std::fs::write(&context_step, step) {
+            self.status = format!("Couldn't write {}: {e}", context_step.display());
+            return;
+        }
+        let return_str = return_path.display().to_string();
+        self.watch.arm(&return_str);
+        self.live_reload = true;
+
+        let sc_exe = std::env::var("CREABIM_SOLIDCRAFT_BIN")
+            .ok()
+            .map(std::path::PathBuf::from)
+            .filter(|p| p.exists())
+            .or_else(|| {
+                let p = std::path::PathBuf::from(r"C:\Program Files\SolidCraft\solidcraft.exe");
+                p.exists().then_some(p)
+            })
+            .unwrap_or_else(|| std::path::PathBuf::from("solidcraft"));
+
+        let launched = std::process::Command::new(&sc_exe)
+            .arg(&context_step)
+            .spawn()
+            .is_ok();
+        if launched {
+            self.status = format!(
+                "Opened {} in SolidCraft. Export new parts to {} to live-reload.",
+                context_step.display(),
+                return_path.display()
+            );
+        } else {
+            self.status = format!(
+                "Exported {} and watching {}. Open it in SolidCraft and export new parts to return.glb.",
+                context_step.display(),
+                return_path.display()
+            );
+        }
+    }
+
     /// "Assign as": give a mesh a building meaning, or change its class.
     fn assign_panel(&mut self, ui: &mut egui::Ui, id: ElementId) {
         let Some(e) = self.doc.model().get(id) else {
@@ -11189,7 +11244,7 @@ impl eframe::App for CreaBimApp {
             for f in self.watch.changed(self.doc.model()) {
                 self.reload(&f);
             }
-            if !crate::files::linked_files(self.doc.model()).is_empty() {
+            if self.watch.has_armed() || !crate::files::linked_files(self.doc.model()).is_empty() {
                 ctx.request_repaint_after(std::time::Duration::from_secs(1));
             }
         }

@@ -391,6 +391,25 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
         }
     };
 
+    let glass_rgb = c.w.add("IFCCOLOURRGB", "$,0.72,0.85,0.92");
+    let glass_ren = c.w.add(
+        "IFCSURFACESTYLERENDERING",
+        format!("{glass_rgb},0.7,$,$,$,$,$,IFCSPECULARROUGHNESS(0.05),.GLASS."),
+    );
+    let glass_style = c.w.add(
+        "IFCSURFACESTYLE",
+        format!("'Glass',.BOTH.,({glass_ren})"),
+    );
+    let frame_rgb = c.w.add("IFCCOLOURRGB", "$,0.25,0.25,0.27");
+    let frame_ren = c.w.add(
+        "IFCSURFACESTYLERENDERING",
+        format!("{frame_rgb},0.,$,$,$,$,$,IFCSPECULARROUGHNESS(0.4),.NOTDEFINED."),
+    );
+    let frame_style = c.w.add(
+        "IFCSURFACESTYLE",
+        format!("'Frame',.BOTH.,({frame_ren})"),
+    );
+
     for e in model.iter() {
         if cutters.contains(&e.id) {
             continue;
@@ -443,6 +462,9 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                     let pos = c.placement3d(DVec3::ZERO, None, None);
                     let solid =
                         c.rect_extrusion(size.truncate() / 2.0, size.x, size.y, pos, size.z);
+                    if b.part == CurtainPart::Glass {
+                        c.w.add("IFCSTYLEDITEM", format!("{solid},({glass_style}),$"));
+                    }
                     let shape = c.shape("SweptSolid", &[solid]);
                     let (class, tail, what) = match b.part {
                         CurtainPart::Mullion => ("IFCMEMBER", ",$,.MULLION.", "mullion"),
@@ -498,8 +520,13 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 let ends = joins.get(&e.id).cloned().unwrap_or_default();
                 let t = wall.thickness / 2.0;
                 let asm = creabim_core::assembly_of(model, e);
-                // a layered wall's core may run on past its faces at a T
-                let core = asm.map_or((-t, t), |(_, a)| creabim_core::assembly::wall_core(a, wall));
+                // In Modelled/Joined mode without differing layer ends, keep the full wall thickness
+                // so outer cladding and airgap thickness are not dropped from the IfcWall body.
+                let core = if layers_mode || layers_differ(e, &joins) {
+                    asm.map_or((-t, t), |(_, a)| creabim_core::assembly::wall_core(a, wall))
+                } else {
+                    (-t, t)
+                };
                 // an attached top is cut by the undersides over it
                 let top = creabim_core::walls::top_profile(model, wall);
                 let z0 = elevation(Some(wall.level)) + wall.base_offset;
@@ -529,6 +556,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                         "IFCEXTRUDEDAREASOLID",
                         format!("{prof},{pos},{},{}", c.z_axis, real(depth)),
                     );
+                    let mut clipped = false;
                     if let Some(tp) = &top {
                         // wall-local: x along the wall from its axis start
                         let to_local = |p: DVec2| {
@@ -536,12 +564,19 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                             DVec2::new(q.dot(d), q.dot(n))
                         };
                         for f in &tp.faces {
+                            let (a, b) = (f.g.dot(d), f.g.dot(n));
+                            let h = f.c + f.g.dot(origin) - z0;
+                            if a.abs() < 1e-6 && b.abs() < 1e-6 && h >= depth - 1e-4 {
+                                continue;
+                            }
                             solid = clip_under(&mut c, solid, f, to_local, d, n, origin, z0);
+                            clipped = true;
                         }
                     }
-                    solids.push(solid);
+                    solids.push((solid, clipped));
                 }
-                let clipped = top.is_some();
+                let clipped = solids.iter().any(|(_, cl)| *cl);
+                let solids: Vec<Ref> = solids.into_iter().map(|(s, _)| s).collect();
                 // the axis lets other tools (and our importer) recover the
                 // location line whatever the joins did to the ends
                 let a0 = c.w.add("IFCCARTESIANPOINT", point2(0.0, 0.0));
@@ -828,6 +863,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
     }
 
     // Openings need their host wall exported first, so they get a second pass.
+
     for e in model.iter() {
         let ElementKind::Opening(o) = &e.kind else {
             continue;
@@ -885,7 +921,14 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 b.lo
             };
             let pos = c.placement3d(lo, None, None);
-            parts.push(c.rect_extrusion(size.truncate() / 2.0, size.x, size.y, pos, size.z));
+            let solid = c.rect_extrusion(size.truncate() / 2.0, size.x, size.y, pos, size.z);
+            let style = if b.part == creabim_geom::opening::Part::Glass {
+                glass_style
+            } else {
+                frame_style
+            };
+            c.w.add("IFCSTYLEDITEM", format!("{solid},({style}),$"));
+            parts.push(solid);
         }
         if parts.is_empty() {
             continue;
@@ -933,6 +976,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
 
     // A curtain wall set in a wall cuts its own opening there and fills it,
     // as a door does.
+
     for e in model.iter() {
         let ElementKind::Wall(wall) = &e.kind else {
             continue;
@@ -971,6 +1015,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
     let mut material_refs: HashMap<ElementId, Ref> = HashMap::new();
     // each material's surface style, for styling the parts of objects
     let mut material_styles: HashMap<ElementId, Ref> = HashMap::new();
+
     for e in model.iter() {
         let users = by_material.get(&e.id);
         let ElementKind::Material(mat) = &e.kind else {
@@ -1034,6 +1079,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
     // Assemblies as layer sets, unused ones too; each layered element gets
     // a usage saying how the set lies in it (walls across, slabs down).
     let mut layer_sets: HashMap<ElementId, Ref> = HashMap::new();
+
     for e in model.iter() {
         let ElementKind::Assembly(a) = &e.kind else {
             continue;
@@ -1100,6 +1146,7 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
 
     // Element types, each with its shared parameters, its material or
     // layer set, and the elements of the type.
+
     for e in model.iter() {
         let ElementKind::ElementType(t) = &e.kind else {
             continue;
@@ -1665,6 +1712,7 @@ fn spaces(
 ) {
     let mut separators: HashMap<ElementId, Ref> = HashMap::new();
     let mut contained: HashMap<ElementId, Vec<Ref>> = HashMap::new();
+
     for e in model.iter() {
         let ElementKind::RoomSeparator(s) = &e.kind else {
             continue;
@@ -1879,6 +1927,7 @@ fn part_entity(e: &Element) -> (String, String) {
 /// The marks of everything that has one, objects' from their types.
 fn element_marks(model: &Model) -> HashMap<ElementId, String> {
     let mut out = creabim_core::marks(model);
+
     for e in model.iter() {
         if matches!(e.kind, ElementKind::Object(_)) {
             if let Some(m) = creabim_core::marks::object_mark(model, e) {
