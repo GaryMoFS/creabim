@@ -795,7 +795,10 @@ impl CreaBimApp {
             Item::Header("Linked files".into()),
             Item::new("link", "Import and link…")
                 .icon("link")
-                .hint("Bring in the objects of a .blend or .FCStd file. Saving it in Blender or FreeCAD updates them here."),
+                .hint("Bring in the objects of a .blend, .FCStd or .glb/.gltf file. Saving it updates them here."),
+            Item::new("solidcraft.send", "Send selection to SolidCraft")
+                .icon("box")
+                .hint("Export selected elements (or whole model) to .solidcraft/context.glb, arm live-reload for return.glb, and launch SolidCraft."),
             Item::new("live", "Reload linked files when saved").checked(self.live_reload),
         ]);
         if self.import_report.is_some() {
@@ -1657,6 +1660,7 @@ impl CreaBimApp {
                     self.link_file(&path);
                 }
             }
+            "solidcraft.send" => self.send_to_solidcraft(),
             "live" => self.live_reload = !self.live_reload,
             "import.report" => {
                 if let Some(r) = &mut self.import_report {

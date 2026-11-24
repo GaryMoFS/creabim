@@ -518,8 +518,15 @@ pub fn export_ifc4(model: &Model, opts: &ExportOptions) -> String {
                 let ends = joins.get(&e.id).cloned().unwrap_or_default();
                 let t = wall.thickness / 2.0;
                 let asm = creabim_core::assembly_of(model, e);
-                // a layered wall's core may run on past its faces at a T
-                let core = asm.map_or((-t, t), |(_, a)| creabim_core::assembly::wall_core(a, wall));
+                // A layered wall's core may run on past its faces at a T. The
+                // body is only the core when the other layers go out as their
+                // own parts (layers mode, or layers that differ); otherwise it
+                // keeps the full thickness so cladding and air gaps aren't lost.
+                let core = if layers_mode || layers_differ(e, &joins) {
+                    asm.map_or((-t, t), |(_, a)| creabim_core::assembly::wall_core(a, wall))
+                } else {
+                    (-t, t)
+                };
                 // an attached top is cut by the undersides over it
                 let top = creabim_core::walls::top_profile(model, wall);
                 let z0 = elevation(Some(wall.level)) + wall.base_offset;

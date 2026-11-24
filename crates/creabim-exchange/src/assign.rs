@@ -28,6 +28,7 @@ impl Assign {
             "IfcStair",
             "IfcRailing",
             "IfcCovering",
+            "IfcPipeSegment",
             "IfcFurniture",
             "IfcBuildingElementProxy",
         ] {

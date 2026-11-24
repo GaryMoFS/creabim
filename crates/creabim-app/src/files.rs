@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{Duration, Instant, SystemTime};
 
 /// The kinds of file that come in as linked objects.
-pub const LINKABLE: &[&str] = &["blend", "fcstd"];
+pub const LINKABLE: &[&str] = &["blend", "fcstd", "glb", "gltf"];
 
 fn ext(path: &str) -> String {
     Path::new(path)
@@ -32,6 +32,9 @@ pub fn read_incoming(path: &str) -> Result<Vec<Incoming>, String> {
     match ext(path).as_str() {
         "blend" => creabim_exchange::blend::read_file(Path::new(path)).map_err(|e| e.to_string()),
         "fcstd" => creabim_exchange::freecad::read_file(Path::new(path)).map_err(|e| e.to_string()),
+        "glb" | "gltf" => creabim_exchange::gltf_read::read_file(Path::new(path))
+            .map(|(objs, _)| objs)
+            .map_err(|e| e.to_string()),
         other => Err(format!("CreaBIM can't read .{other} files yet.")),
     }
 }
@@ -52,6 +55,7 @@ pub fn linked_files(model: &Model) -> Vec<String> {
 #[derive(Default)]
 pub struct Watch {
     seen: HashMap<String, Option<SystemTime>>,
+    armed: Vec<String>,
     last: Option<Instant>,
 }
 
@@ -59,6 +63,19 @@ impl Watch {
     /// Remember a file as it is now, e.g. right after reading it.
     pub fn mark(&mut self, file: &str) {
         self.seen.insert(file.to_string(), modified(file));
+    }
+
+    /// Pre-arm a file path (e.g. a SolidCraft return `.glb`) so CreaBIM watches
+    /// for its creation or update even before any element from it exists yet.
+    pub fn arm(&mut self, file: &str) {
+        if !self.armed.iter().any(|f| f == file) {
+            self.armed.push(file.to_string());
+        }
+        self.mark(file);
+    }
+
+    pub fn has_armed(&self) -> bool {
+        !self.armed.is_empty()
     }
 
     /// Files saved since they were last seen. Looks at most once a second.
@@ -70,8 +87,14 @@ impl Watch {
             return vec![];
         }
         self.last = Some(Instant::now());
+        let mut files = linked_files(model);
+        for f in &self.armed {
+            if !files.contains(f) {
+                files.push(f.clone());
+            }
+        }
         let mut out = Vec::new();
-        for f in linked_files(model) {
+        for f in files {
             let now = modified(&f);
             match self.seen.get(&f) {
                 None => {
@@ -316,7 +339,10 @@ pub fn pick_open() -> Option<String> {
         )
         .add_filter("CreaBIM project", &["creabim"])
         .add_filter("IFC", &["ifc", "ifcx"])
-        .add_filter("Blender and FreeCAD (linked)", &["blend", "FCStd", "fcstd"])
+        .add_filter(
+            "Linked files (Blender, FreeCAD, glTF)",
+            &["blend", "FCStd", "fcstd", "glb", "gltf"],
+        )
         .add_filter(
             "Materials (FreeCAD cards, glTF)",
             &["FCMat", "fcmat", "gltf", "glb"],
